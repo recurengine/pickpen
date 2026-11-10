@@ -103,3 +103,49 @@ export function isLocalPathLandable(path: string, isWindows: boolean): boolean {
 	}
 	return true;
 }
+
+// Obsidian 1.14.4+ 库外文件（TExternalFile）的逻辑路径 = "file:" + 真实文件系统绝对路径。
+// 已观测：file:/Users/a/x.md、file:C:/Users/a/x.md；扫描还可能物化出目录行
+// file:、file:C:、file:/Users。宽口径只匹配首段，避免误伤 file:Cat.md、notes/file:/x。
+const EXTERNAL_PATH_RE = /^file:(?:[A-Za-z]:[\\/]|[\\/]|$|[A-Za-z]:$)/;
+
+/** 是否为库外文件伪路径：从扫描/对账/提示中排除（所有平台） */
+export function isExternalPath(path: string): boolean {
+	return EXTERNAL_PATH_RE.test(path);
+}
+
+// 安全清理只认 Windows 盘符型：file:C:/... 在 POSIX 上不可能是真实外部文件的绝对路径。
+// file:/Users/... 不在此列，避免旧 Mac 客户端收到 tombstone 后 trash 用户的真实文件。
+const EXTERNAL_CLEANUP_RE = /^file:[A-Za-z]:[\\/]/;
+
+export function isExternalCleanupCandidate(path: string): boolean {
+	return EXTERNAL_CLEANUP_RE.test(path);
+}
+
+/** 从远端路径集合中挑出要清理的 Windows 盘符型伪路径，并把集合内实际存在的祖先
+ *  目录行一并加入。例：file:C:/Users/a.md + file:C: + file:C:/Users 三条都删。
+ *  仅返回入参集合里存在的路径；file:/Users/... 及其祖先不会因非候选而被加入。 */
+export function collectExternalCleanupPaths(paths: Iterable<string>): string[] {
+	const all = new Set(paths);
+	const out = new Set<string>();
+	for (const p of all) {
+		if (!isExternalCleanupCandidate(p)) continue;
+		out.add(p);
+		let slash = p.lastIndexOf("/");
+		while (slash > 0) {
+			const parent = p.slice(0, slash);
+			if (all.has(parent) && isExternalPath(parent)) out.add(parent);
+			slash = parent.lastIndexOf("/");
+		}
+	}
+	return [...out];
+}
+
+export type RestoreRejectReason = "external" | "platform";
+
+/** 历史/已删除文件恢复入口统一判定：库外路径优先（不展示成平台非法提示） */
+export function restoreRejectReason(path: string, isWindows: boolean): RestoreRejectReason | null {
+	if (isExternalPath(path)) return "external";
+	if (!isLocalPathLandable(path, isWindows)) return "platform";
+	return null;
+}

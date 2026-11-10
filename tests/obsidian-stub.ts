@@ -27,6 +27,11 @@ export function normalizePath(path: string): string {
 
 export class TAbstractFile {}
 export class TFile extends TAbstractFile {}
+export class TExternalFile extends TFile {
+	getRealPath(): string {
+		return "";
+	}
+}
 export class TFolder extends TAbstractFile {}
 export class Vault {
 	// stub：不建模 adapter/getBasePath，vaultScopeKey 在测试中不调用

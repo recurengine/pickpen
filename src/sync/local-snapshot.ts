@@ -19,7 +19,8 @@ import { ProgressTracker, type ProgressCallback } from "./progress";
 import { isTooBig, normalize } from "../excludes";
 import type { BlockedPathInfo, BlockedReason } from "./blocked";
 import type { SyncFilter } from "./selective";
-import { nfcPath, detectCaseConflicts } from "./path";
+import { isExternalFile } from "./external-file";
+import { nfcPath, detectCaseConflicts, isExternalPath } from "./path";
 import { canEncodePath } from "../crypto/path-crypto";
 import { sealForRemote } from "../crypto/vault-key-store";
 import { KIND_DIR, KIND_FILE } from "./types";
@@ -131,6 +132,9 @@ export class LocalSnapshotBuilder {
 		if (!this.current) {
 			// 冷启动：以 Base（若有）为骨架，等 force_audit 校正
 			this.current = ctx.base ? cloneSnapshot(ctx.base) : emptyLocal(ctx.base);
+			// 旧基线可能残留库外伪路径（Obsidian 1.14.4+ TExternalFile 曾进入同步范围）：
+			// 进入快照前剔除，不阻塞、不推断删除；远端清理由 session 的 cleanup 负责
+			this.dropExternalEntries();
 		}
 		if (ctx.pathEncrypted) {
 			// 仓库在別处刚切换为 v2 时，内存里的 current 可能还留着 v1 时代扫到的
@@ -216,6 +220,8 @@ export class LocalSnapshotBuilder {
 		for (const f of files) {
 			await yieldCtl.tick(100, 50);
 			const path = normalize(f.path);
+			// 库外文件（TExternalFile）不是仓库内容：类型信号 + 路径形状双保险
+			if (isExternalFile(f) || isExternalPath(path)) continue;
 			if (ctx.filter.isExcluded(path)) continue;
 			const stat = f.stat;
 			if (stat && isTooBig(stat.size, ctx.maxFileSizeBytes)) {
@@ -230,6 +236,7 @@ export class LocalSnapshotBuilder {
 		for (const f of ctx.vault.getAllLoadedFiles()) {
 			if (!(f instanceof TFolder) || f.path === "/") continue;
 			const path = normalize(f.path);
+			if (isExternalPath(path)) continue;
 			if (ctx.filter.isExcluded(path, true)) continue;
 			dirs.push(path);
 			dirSet.add(path);
@@ -420,6 +427,14 @@ export class LocalSnapshotBuilder {
 		return [...blocked.values()];
 	}
 
+	/** 剔除内存 Local 中的库外伪路径（旧 Base 克隆或历史增量残留）：不阻塞、不推断删除 */
+	private dropExternalEntries(): void {
+		if (!this.current) return;
+		for (const path of Object.keys(this.current.entries)) {
+			if (isExternalPath(path)) delete this.current.entries[path];
+		}
+	}
+
 	/** 剔除内存 Local 中无法编码为 token 的路径（v2 模式）；返回 blocked 明细。
 	 * 只在调用方已确认 pathEncrypted 时使用。 */
 	private sanitizeUnencodable(): BlockedPathInfo[] {
@@ -428,6 +443,7 @@ export class LocalSnapshotBuilder {
 		for (const path of Object.keys(this.current.entries)) {
 			if (canEncodePath(path)) continue;
 			delete this.current.entries[path];
+			if (isExternalPath(path)) continue; // 库外伪路径静默剔除，不进入 blocked
 			blocked.push({ path, reason: "path_unencodable" });
 		}
 		return blocked;
@@ -456,6 +472,7 @@ export class LocalSnapshotBuilder {
 				const path = normalize(rawPath);
 				const np = nfcPath(path);
 				if (np === null) continue;
+				if (isExternalPath(np)) continue; // 库外伪路径不进入本地快照
 				if (ctx.pathEncrypted && !canEncodePath(np)) {
 					// 无法编码为 token：绝不把明文路径/无法还原的条目送进 buildTree；
 					// 若这是 rename 的新路径，把旧路径钉回 Base（blocked），否则旧路径会被
@@ -490,6 +507,7 @@ export class LocalSnapshotBuilder {
 					continue;
 				}
 				const file = ctx.vault.getFileByPath(np);
+				if (file && isExternalFile(file)) continue;
 				if (!file) {
 					// Obsidian 索引已无此文件 = 真实删除（dirty 来自 vault 事件，索引即真相源）：
 					// Base/current 有该路径 → deleted；否则忽略（未同步过的路径无状态变化）。

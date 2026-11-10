@@ -1,7 +1,7 @@
 // LocalHint 目录级事件升级 forceAudit 测试（目录 rename/delete 影响整棵子树，
 // 子文件事件可能跨轮/丢失，增量刷新会快照失真 → 升级全量审计兜底）。
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { TFile, TFolder, type Vault } from "obsidian";
+import { TExternalFile, TFile, TFolder, type Vault } from "obsidian";
 import { LocalHint } from "../src/sync/local-hint";
 import type { ReconcileSession } from "../src/sync/session";
 
@@ -104,5 +104,54 @@ describe("目录级事件升级 forceAudit", () => {
 		expect(session.requestRun).toHaveBeenCalledTimes(1);
 		vi.advanceTimersByTime(1);
 		expect(session.requestRun).toHaveBeenCalledTimes(2);
+	});
+});
+
+describe("库外文件事件", () => {
+	function external(path: string): TExternalFile {
+		return Object.assign(new TExternalFile(), { path }) as TExternalFile;
+	}
+
+	it("create/modify/delete 不进入 dirty，也不触发 Session", () => {
+		vi.useFakeTimers();
+		const { handlers, session } = makeHint();
+		handlers.create(external("file:/Users/a/x.md"));
+		handlers.modify(external("file:C:/Users/b.md"));
+		handlers.delete(external("file:/Users/c.md"));
+		vi.advanceTimersByTime(2500);
+
+		expect(session.addDirty).not.toHaveBeenCalled();
+		expect(session.addConfirmedDelete).not.toHaveBeenCalled();
+		expect(session.requestRun).not.toHaveBeenCalled();
+	});
+
+	it("普通 TFile 但 path 为库外伪路径同样跳过", () => {
+		vi.useFakeTimers();
+		const { handlers, session } = makeHint();
+		handlers.modify(Object.assign(new TFile(), { path: "file:/Users/a/x.md" }));
+		vi.advanceTimersByTime(2500);
+
+		expect(session.addDirty).not.toHaveBeenCalled();
+		expect(session.requestRun).not.toHaveBeenCalled();
+	});
+
+	it("rename：库内→库外按删除传播；库外→库内只标脏新路径；库外→库外忽略", () => {
+		vi.useFakeTimers();
+
+		const h1 = makeHint();
+		h1.handlers.rename(Object.assign(new TFile(), { path: "file:/Users/a.md" }), "a.md");
+		expect(h1.session.addConfirmedDelete).toHaveBeenCalledWith("a.md");
+		expect(h1.session.addDirtyRename).not.toHaveBeenCalled();
+
+		const h2 = makeHint();
+		h2.handlers.rename(Object.assign(new TFile(), { path: "b.md" }), "file:/Users/b.md");
+		expect(h2.session.addDirty).toHaveBeenCalledWith("b.md");
+		expect(h2.session.addDirtyRename).not.toHaveBeenCalled();
+
+		const h3 = makeHint();
+		h3.handlers.rename(external("file:/Users/c.md"), "file:/Users/d.md");
+		vi.advanceTimersByTime(2500);
+		expect(h3.session.addDirty).not.toHaveBeenCalled();
+		expect(h3.session.addConfirmedDelete).not.toHaveBeenCalled();
 	});
 });

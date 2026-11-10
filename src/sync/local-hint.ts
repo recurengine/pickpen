@@ -8,6 +8,8 @@ import { TFolder, type EventRef, type Vault } from "obsidian";
 
 import { debugLog } from "../debug-log";
 import { normalize } from "../excludes";
+import { isExternalVaultEntry } from "./external-file";
+import { isExternalPath } from "./path";
 import type { ReconcileSession } from "./session";
 
 export class LocalHint {
@@ -42,21 +44,21 @@ export class LocalHint {
 		this.registered = true;
 		this.registerEvent(
 			this.vault.on("create", (file) => {
-				if (!this.registered) return;
+				if (!this.registered || isExternalVaultEntry(file)) return;
 				this.session.addDirty(normalize(file.path));
 				this.scheduleRequest();
 			}),
 		);
 		this.registerEvent(
 			this.vault.on("modify", (file) => {
-				if (!this.registered) return;
+				if (!this.registered || isExternalVaultEntry(file)) return;
 				this.session.addDirty(normalize(file.path));
 				this.scheduleRequest();
 			}),
 		);
 		this.registerEvent(
 			this.vault.on("delete", (file) => {
-				if (!this.registered) return;
+				if (!this.registered || isExternalVaultEntry(file)) return;
 				// 目录删除影响整棵子树：升级 forceAudit 兜底（见 pendingForceAudit 注释）
 				if (file instanceof TFolder) this.pendingForceAudit = true;
 				this.session.addConfirmedDelete(normalize(file.path));
@@ -66,6 +68,23 @@ export class LocalHint {
 		this.registerEvent(
 			this.vault.on("rename", (file, oldPath) => {
 				if (!this.registered) return;
+				const newExt = isExternalVaultEntry(file);
+				const oldExt = isExternalPath(normalize(oldPath));
+				if (newExt && oldExt) return;
+				if (newExt) {
+					// 库内 → 库外：旧路径按删除传播，库外新路径不进入同步
+					if (file instanceof TFolder) this.pendingForceAudit = true;
+					this.session.addConfirmedDelete(normalize(oldPath));
+					this.scheduleRequest();
+					return;
+				}
+				if (oldExt) {
+					// 库外 → 库内：只把新路径当新增，不继承库外身份
+					if (file instanceof TFolder) this.pendingForceAudit = true;
+					this.session.addDirty(normalize(file.path));
+					this.scheduleRequest();
+					return;
+				}
 				// addDirtyRename：标脏两路径 + 记录 new→old 映射（file_id 继承保 rename 身份；
 				// 若 hint 在本轮丢失只退化为新 file_id，同步正确性不受影响）。
 				// 目录重命名影响整棵子树：升级 forceAudit 兜底（见 pendingForceAudit 注释）

@@ -14,6 +14,7 @@ import type { DataAdapter } from "obsidian";
 
 import { debugLog } from "../debug-log";
 import { DEFAULT_EXCLUDES, isConflictCopyPath, isHidden, matchPattern, normalize } from "../excludes";
+import { isExternalPath } from "./path";
 
 /** 文件类型分类（note = 笔记格式，恒同步） */
 export type FileKind = "note" | "image" | "audio" | "video" | "pdf" | "other";
@@ -248,6 +249,8 @@ export function createSyncFilter(opts: SyncFilterOptions): SyncFilter {
 	const isExcluded = (path: string, isDir = false): boolean => {
 		const p = normalize(path);
 		if (p === "") return true;
+		// 库外文件（file:/...、file:C:/...）不是 vault 相对路径：扫描、对账、Base out_of_scope 共用。
+		if (isExternalPath(p)) return true;
 		for (const pattern of DEFAULT_EXCLUDES) {
 			if (pattern && matchPattern(p, pattern)) return true;
 		}

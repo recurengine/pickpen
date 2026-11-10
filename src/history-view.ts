@@ -18,7 +18,7 @@ import { debugLog } from "./debug-log";
 import type PickpenPlugin from "./index";
 import { FileVersionState, type FileVersionInfo } from "./gen/proto/sync/sync.ext_pb";
 import { decodeStoredPath } from "./sync/path-codec";
-import { isLocalPathLandable } from "./sync/path";
+import { isExternalPath, restoreRejectReason } from "./sync/path";
 import { isBlobNotReferenced, isUnauthenticated } from "./remote-connect";
 import { normalize } from "./excludes";
 import { diffTexts, type DiffLine } from "./history-diff";
@@ -57,7 +57,7 @@ export function isBinaryContent(content: Uint8Array): boolean {
 export function installHistoryFeature(plugin: PickpenPlugin): void {
 	plugin.registerEvent(
 		plugin.app.workspace.on("file-menu", (menu, file) => {
-			if (!(file instanceof TFile)) return; // 排除文件夹
+			if (!(file instanceof TFile) || isExternalPath(normalize(file.path))) return; // 排除文件夹与库外文件
 			const bound = !!plugin.settings.accessToken && !!plugin.settings.vaultId;
 			const fileId = resolveFileId(plugin.baseStore.getBase(), normalize(file.path));
 			menu.addItem((item) => {
@@ -94,6 +94,10 @@ export function openHistoryForFile(plugin: PickpenPlugin, file: TFile): void {
 		return;
 	}
 	const path = normalize(file.path);
+	if (isExternalPath(path)) {
+		new Notice("库外文件不参与同步，无法查看版本历史");
+		return;
+	}
 	const fileId = resolveFileId(plugin.baseStore.getBase(), path);
 	if (!fileId) {
 		new Notice("该文件尚未同步，无法查看版本历史");
@@ -586,8 +590,13 @@ class HistoryModal extends Modal {
 
 	// restore 恢复：下载全量 → 写盘（自动建父目录，覆盖「曾删除重建」）→ 刷新打开视图 → 触发同步
 	private async restore(v: FileVersionInfo, cachedContent?: Uint8Array): Promise<void> {
-		// 远端历史路径可能含当前系统（Windows）不允许的字符：写盘必然失败，提前给出可操作的提示
-		if (!isLocalPathLandable(this.currentPath, Platform.isWin)) {
+		// 库外伪路径优先拦截；其余远端历史路径可能含当前系统（Windows）不允许的字符
+		const reject = restoreRejectReason(this.currentPath, Platform.isWin);
+		if (reject === "external") {
+			new Notice("库外文件不参与同步，不能恢复");
+			return;
+		}
+		if (reject === "platform") {
 			new Notice("该文件名含当前系统不支持的字符，请在其他设备重命名后再恢复");
 			return;
 		}

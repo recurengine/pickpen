@@ -6,6 +6,7 @@
 import { App, Platform, normalizePath } from "obsidian";
 
 import { openForLocal, remoteHash, sealForRemote, vaultKeys } from "../crypto/vault-key-store";
+import { canEncodePath } from "../crypto/path-crypto";
 import { debugLog } from "../debug-log";
 import { isNetworkPhase } from "../error-report/classify";
 import { reportError } from "../error-report/reporter";
@@ -28,7 +29,7 @@ import { mergeBlockedDetails, type BlockedPathInfo } from "./blocked";
 import { sha256Hex } from "./content-hash";
 import { LocalSnapshotBuilder } from "./local-snapshot";
 import { resolveConflictsByMerge, type MergePassResult } from "./merge-pass";
-import { isLocalPathLandable, nfcPath } from "./path";
+import { collectExternalCleanupPaths, isExternalPath, isLocalPathLandable, nfcPath } from "./path";
 import { encodeDeletes, encodePuts, indexPaths, PATH_MODE_ENCRYPTED, PATH_MODE_PLAIN, treeRoot } from "./path-codec";
 import { PendingStore } from "./pending-store";
 import { entriesEqual, isConflictCopyPath, isRemoteOversized, plan } from "./planner";
@@ -277,6 +278,7 @@ export class ReconcileSession {
 		if (opts?.interactive) this.interactiveRequested = true;
 		if (opts?.dirtyPaths) {
 			for (const p of opts.dirtyPaths) {
+				if (isExternalPath(normalize(p))) continue; // 库外伪路径不进入同步
 				// 显式点名（历史版本恢复、从删除列表还原）属于用户动作：立即解除暂缓
 				this.clearDeferral(p);
 				this.nextDirtyPaths.add(p);
@@ -370,6 +372,7 @@ export class ReconcileSession {
 
 	/** 本地 dirty 事件入口（local-hint 调用；运行中 → 下一轮） */
 	addDirty(path: string): void {
+		if (isExternalPath(normalize(path))) return; // 库外伪路径永远不是仓库内容
 		// 暂缓期间的编辑事件不触发行；解除时统一标脏重扫，避免被持续改写的文件空转
 		if (this.isDeferred(path)) return;
 		this.nextDirtyPaths.add(path);
@@ -379,6 +382,7 @@ export class ReconcileSession {
 	/** 真实删除事件：标脏并登记「用户删除意图」。只有这类路径允许在降档后
 	 *  传播超限远端文件的删除；扫描/切 vault 合成出的 tombstone 不登记。 */
 	addConfirmedDelete(path: string): void {
+		if (isExternalPath(normalize(path))) return;
 		// 删除是终止性事件：竞态已无意义，立即解除暂缓让删除尽快传播
 		this.clearDeferral(path);
 		this.confirmedDeletePaths.add(path);
@@ -387,6 +391,19 @@ export class ReconcileSession {
 
 	/** rename 事件入口（local-hint 调用）：记录 new→old 映射并标脏两路径（保 file_id 身份） */
 	addDirtyRename(oldPath: string, newPath: string): void {
+		const oldExternal = isExternalPath(normalize(oldPath));
+		const newExternal = isExternalPath(normalize(newPath));
+		if (oldExternal && newExternal) return;
+		if (newExternal) {
+			// 库内 → 库外：旧路径按删除传播，库外新路径不进入同步
+			this.addConfirmedDelete(oldPath);
+			return;
+		}
+		if (oldExternal) {
+			// 库外 → 库内：只把新路径当新增，不继承库外路径身份
+			this.addDirty(newPath);
+			return;
+		}
 		this.clearDeferral(oldPath);
 		this.nextDirtyPaths.add(oldPath);
 		this.nextDirtyPaths.add(newPath);
@@ -465,7 +482,7 @@ export class ReconcileSession {
 			[...this.localBlockedDetails, ...this.platformBlockedDetails],
 			this.oversizedRemotePaths,
 			[...this.deferredRacePaths.keys()],
-		);
+		).filter((detail) => !isExternalPath(detail.path));
 		const blockedSet = new Set(blockedDetails.map((detail) => detail.path));
 		// blocked 路径已有「N 个文件未同步」文案，不再计入本地待同步数
 		const pendingCount =
@@ -746,9 +763,14 @@ export class ReconcileSession {
 			this.interruptedTransfer = await readInterrupted(app, this.deps.pluginDir);
 			if (this.interruptedTransfer) {
 				const m = this.interruptedTransfer;
-				debugLog.warn(
-					`[pickpen] 上次同步在${m.kind === "upload" ? "上传" : "下载"} ${m.path}（${formatTransferSize(m.bytes)}）时中断`,
-				);
+				if (isExternalPath(normalize(m.path))) {
+					// 旧版本可能把库外文件传了一半：痕迹已消费，但不要在状态卡里暴露伪路径
+					this.interruptedTransfer = null;
+				} else {
+					debugLog.warn(
+						`[pickpen] 上次同步在${m.kind === "upload" ? "上传" : "下载"} ${m.path}（${formatTransferSize(m.bytes)}）时中断`,
+					);
+				}
 			}
 		}
 
@@ -836,11 +858,20 @@ export class ReconcileSession {
 		this.beginPhase("planning");
 		const localRoot = await treeRoot(local.entries, pathMode);
 		const baseModeMatches = (base?.path_mode ?? PATH_MODE_PLAIN) === pathMode;
+		// Base 里可能残留库外伪路径（旧版本上传）。isExcluded 会跳过它们，若只按
+		// 「排除项之外一致」早退，本轮的远端清理永远不会执行；因此有可清理残留时必须继续。
+		const baseCleanupCandidates = base ? collectExternalCleanupPaths(Object.keys(base.entries)) : [];
+		const baseNeedsExternalCleanup = baseCleanupCandidates.some(
+			(p) =>
+				base?.entries[p]?.state === "active" &&
+				(pathMode !== PATH_MODE_ENCRYPTED || canEncodePath(p)),
+		);
 		if (
 			head.unchanged &&
 			base &&
 			baseModeMatches &&
 			!scopeExpanded &&
+			!baseNeedsExternalCleanup &&
 			(localRoot === base.base_root_hash || sameEntriesExcept(filter, local.entries, base.entries))
 		) {
 			this.finishRound(); // 无变化的空轮次也是一次完成的同步
@@ -876,8 +907,8 @@ export class ReconcileSession {
 
 		// 6b. 远端超限路径（降档后仓库里的存量文件）：内容取不回来，本轮完全无操作。
 		// 只作为受阻提示；升级套餐后自然恢复
-		this.oversizedRemotePaths = Object.keys(remoteEntries).filter((p) =>
-			isRemoteOversized(remoteEntries[p], maxFileSizeBytes),
+		this.oversizedRemotePaths = Object.keys(remoteEntries).filter(
+			(p) => !isExternalPath(p) && isRemoteOversized(remoteEntries[p], maxFileSizeBytes),
 		);
 
 		// 6c. 远端路径在当前平台不可原样落地（如 Windows 文件名含 `"`）：一律阻塞，不产生本地动作。
@@ -887,8 +918,16 @@ export class ReconcileSession {
 		// 只在远端 entries 里存在的 key 上判定（不回退 Base——钉住过期 Base 会让 target_root_hash
 		// 与服务端不符，触发 12018）。
 		const isWindows = Platform.isWin;
+		// 库外伪路径（Obsidian 1.14.4+ TExternalFile 曾被旧版本当普通笔记上传）：
+		// - 宽口径全部从平台阻塞/提示中剔除（isExcluded 已让 planner 跳过）；
+		// - 只对 Windows 盘符型（file:C:/...）自动清理远端，POSIX 型 file:/Users/... 仅隐藏，
+		//   避免旧 Mac 客户端收到 tombstone 后把用户真实的外部文件移入回收站。
+		const externalRemotePaths = Object.keys(remoteEntries).filter(isExternalPath);
+		const remoteCleanupPaths = collectExternalCleanupPaths(externalRemotePaths).filter(
+			(p) => pathMode !== PATH_MODE_ENCRYPTED || canEncodePath(p),
+		);
 		this.platformBlockedPaths = Object.keys(remoteEntries).filter(
-			(p) => !isLocalPathLandable(p, isWindows),
+			(p) => !isExternalPath(p) && !isLocalPathLandable(p, isWindows),
 		);
 		this.platformBlockedDetails = this.platformBlockedPaths
 			.filter((p) => {
@@ -897,6 +936,11 @@ export class ReconcileSession {
 				return e?.state === "active" && !filter.isExcluded(p, (e.kind ?? KIND_FILE) === KIND_DIR);
 			})
 			.map((path) => ({ path, reason: "path_invalid_on_platform" as const }));
+		if (externalRemotePaths.length > 0) {
+			debugLog.warn(
+				`[pickpen] 远端含 ${externalRemotePaths.length} 个库外文件伪路径：本轮清理 ${remoteCleanupPaths.length} 个，仅隐藏 ${externalRemotePaths.length - remoteCleanupPaths.length} 个`,
+			);
+		}
 		if (this.platformBlockedDetails.length > 0) {
 			debugLog.warn(
 				`[pickpen] ${this.platformBlockedDetails.length} 个远端路径在当前平台不可落地，已阻塞（如：${this.platformBlockedDetails[0].path}）`,
@@ -914,7 +958,7 @@ export class ReconcileSession {
 				...this.deferredRacePaths.keys(),
 				...this.platformBlockedPaths,
 			]),
-		];
+		].filter((p) => !isExternalPath(p));
 		const planResult = plan({
 			base,
 			local,
@@ -922,6 +966,7 @@ export class ReconcileSession {
 			deviceId: settings.deviceId,
 			blockedPaths: planBlockedPaths,
 			remoteOversizedPaths: this.oversizedRemotePaths,
+			remoteCleanupPaths,
 			confirmedDeletePaths: this.roundConfirmedDeletes,
 			filter,
 		});
@@ -972,7 +1017,11 @@ export class ReconcileSession {
 
 		// 本轮不在同步范围内的路径：Base 条目只是远端回声（planner 按 Bootstrap 裁决），
 		// 标记 out_of_scope 交给下一轮，避免开关打开时把本地旧内容当成「仅本地修改」传上去
+		const cleanupSet = new Set(remoteCleanupPaths);
 		const outOfScope = (path: string): boolean => {
+			// 清理路径必须落成正常 tombstone，而不是 out_of_scope：后者会让下一轮按
+			// Bootstrap 处理，远端垃圾可能被重新视为“未知来源”而失去删除语义
+			if (cleanupSet.has(path)) return false;
 			const e = planResult.target_entries[path];
 			return filter.isExcluded(path, (e?.kind ?? KIND_FILE) === KIND_DIR);
 		};
@@ -991,7 +1040,10 @@ export class ReconcileSession {
 			// 目标树连同 Head 的 root 落成新 Base —— 此后 Head 看似匹配、快路径拿过期条目当
 			// 远端真值，凡有本地改动都算错 target_root_hash（12018，提交失败 ⇒ Base 不前进 ⇒
 			// 死循环）。不等就保持旧 Base（落后无害：下一轮 Head 不再匹配，自然改走完整 Manifest）
-			if ((localRoot !== base?.base_root_hash || scopeExpanded) && planResult.target_root_hash === head.rootHash) {
+			if (
+				(localRoot !== base?.base_root_hash || scopeExpanded || baseNeedsExternalCleanup) &&
+				planResult.target_root_hash === head.rootHash
+			) {
 				this.beginPhase("finishing");
 				await baseStore.saveBase({
 					schema_version: 2,
@@ -1037,7 +1089,7 @@ export class ReconcileSession {
 			mergePass.mergedPaths,
 			this.beginPhase("verifying"),
 			repairOnlyPuts,
-			repairOnlyDeletes,
+			new Set([...repairOnlyDeletes, ...remoteCleanupPaths]),
 		);
 
 		// 10. PutBlob 预上传服务端缺失的内容 Blob（§9.1 步骤 10）
@@ -1256,11 +1308,27 @@ export class ReconcileSession {
 				// 旧版本可能在 pending 里留下当前平台无法落地的动作（如 Windows 上的非法文件名）：
 				// 原样重放会让 apply 每一轮都失败、pending 永远清不掉。这里只跳过这些路径，
 				// 其余动作照常幂等重放；被跳过的路径计入 unverified，避免 Base 把它们当成本地已落地。
-				const unlandablePaths = new Set(
+				// 库外伪路径单独成组：任何平台都不得按旧 pending 去写/删本地 file: 路径，
+				// 且不能展示成“平台不支持的字符”（远端清理由正常轮次的 cleanup 负责）。
+				const externalActionPaths = new Set(
 					pending.apply_actions
-						.filter((a) => !isLocalPathLandable(a.path, Platform.isWin))
+						.filter((a) => isExternalPath(normalize(a.path)))
 						.map((a) => a.path),
 				);
+				const unlandablePaths = new Set(
+					pending.apply_actions
+						.filter(
+							(a) =>
+								!externalActionPaths.has(a.path) &&
+								!isLocalPathLandable(a.path, Platform.isWin),
+						)
+						.map((a) => a.path),
+				);
+				if (externalActionPaths.size > 0) {
+					debugLog.warn(
+						`[pickpen] pending 中有 ${externalActionPaths.size} 个库外文件伪路径，跳过本地落地`,
+					);
+				}
 				if (unlandablePaths.size > 0) {
 					debugLog.warn(
 						`[pickpen] pending 中有 ${unlandablePaths.size} 个路径在当前平台不可落地，跳过本地落地`,
@@ -1275,7 +1343,9 @@ export class ReconcileSession {
 						)
 						.map((a) => ({ path: a.path, reason: "path_invalid_on_platform" as const }));
 				}
-				const actions = pending.apply_actions.filter((a) => !unlandablePaths.has(a.path));
+				const actions = pending.apply_actions.filter(
+					(a) => !unlandablePaths.has(a.path) && !externalActionPaths.has(a.path),
+				);
 				await this.applier.applyPlan({
 					onProgress: this.beginPhase("applying"),
 					actions,
@@ -1307,7 +1377,10 @@ export class ReconcileSession {
 					path_mode: pathMode,
 				}, {
 					unverified: (path) =>
-						skippedPaths.has(path) || unlandablePaths.has(path) || isOutOfScope(path),
+						skippedPaths.has(path) ||
+						unlandablePaths.has(path) ||
+						externalActionPaths.has(path) ||
+						isOutOfScope(path),
 					outOfScope: isOutOfScope,
 				});
 				await pendingStore.clear();

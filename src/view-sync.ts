@@ -6,6 +6,8 @@ import { App, MarkdownView } from "obsidian";
 
 import { debugLog } from "./debug-log";
 import { normalize } from "./excludes";
+import { isExternalVaultEntry } from "./sync/external-file";
+import { isExternalPath } from "./sync/path";
 
 export interface OpenMarkdownViewState {
 	view: MarkdownView;
@@ -23,6 +25,7 @@ function normalizeEol(text: string): string {
 // openMarkdownViews 返回 path 对应的打开 markdown 视图（原 engine.hasOpenLeaf 的比对逻辑迁入）
 export function openMarkdownViews(app: App, path: string): MarkdownView[] {
 	const p = normalize(path);
+	if (isExternalPath(p)) return []; // 库外文件不参与同步/视图刷新
 	return app.workspace
 		.getLeavesOfType("markdown")
 		.map((leaf) => leaf.view)
@@ -34,7 +37,7 @@ export async function captureAllOpenViews(app: App): Promise<OpenMarkdownViewSta
 	const states: OpenMarkdownViewState[] = [];
 	for (const leaf of app.workspace.getLeavesOfType("markdown")) {
 		const view = leaf.view;
-		if (!(view instanceof MarkdownView) || view.file == null) continue;
+		if (!(view instanceof MarkdownView) || view.file == null || isExternalVaultEntry(view.file)) continue;
 		states.push(...(await captureOpenViews(app, normalize(view.file.path))));
 	}
 	return states;
@@ -43,6 +46,7 @@ export async function captureAllOpenViews(app: App): Promise<OpenMarkdownViewSta
 // captureOpenViews 捕获打开视图状态：缓冲快照 + 与磁盘比对的脏标记
 export async function captureOpenViews(app: App, path: string): Promise<OpenMarkdownViewState[]> {
 	const p = normalize(path);
+	if (isExternalPath(p)) return [];
 	const states: OpenMarkdownViewState[] = [];
 	for (const view of openMarkdownViews(app, p)) {
 		let buffer = "";
@@ -67,6 +71,7 @@ export async function captureOpenViews(app: App, path: string): Promise<OpenMark
 export async function saveDirtyOpenViews(app: App, states: OpenMarkdownViewState[]): Promise<number> {
 	let saved = 0;
 	for (const s of states) {
+		if (isExternalPath(normalize(s.path))) continue; // 绝不替用户保存库外文件
 		if (!s.dirty) {
 			continue;
 		}
@@ -92,6 +97,7 @@ export async function refreshOpenViews(app: App, states: OpenMarkdownViewState[]
 	const decoded = normalizeEol(new TextDecoder("utf-8").decode(content));
 	for (const s of states) {
 		const view = s.view;
+		if (isExternalPath(normalize(s.path))) continue; // 库外文件不刷新
 		if (view.file == null || normalize(view.file.path) !== s.path) {
 			continue; // 处理期间视图已切换/关闭
 		}

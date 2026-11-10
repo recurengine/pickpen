@@ -33,6 +33,10 @@ export interface PlanInput {
 	confirmedDeletePaths?: ReadonlySet<string>;
 	/** 选择性同步过滤（类型/文件夹/配置分类）：被排除路径本轮完全无操作 */
 	filter?: SyncFilter;
+	/** 远端库外伪路径（file:C:/...）：只清远端，不产生任何本地动作。
+	 * 必须在 excluded 分支之前处理——isExcluded 现在会命中这些路径并 continue，
+	 * 目标树会保留远端 active 垃圾，远端条目永远无法删除。 */
+	remoteCleanupPaths?: readonly string[];
 	now?: Date; // 测试注入
 }
 
@@ -66,6 +70,7 @@ export function plan(input: PlanInput): SyncPlan {
 	const now = input.now ?? new Date();
 	const blockedSet = new Set(input.blockedPaths ?? []);
 	const oversizedRemote = new Set(input.remoteOversizedPaths ?? []);
+	const cleanupSet = new Set(input.remoteCleanupPaths ?? []);
 	// 被排除路径（类型关闭 / 排除文件夹 / 配置分类关闭 / pickpen 自身目录）本轮完全无操作。
 	// 目录按结构判定（类型白名单不适用于目录），因此先按三方条目取 kind
 	const excluded = (path: string): boolean => {
@@ -158,6 +163,21 @@ export function plan(input: PlanInput): SyncPlan {
 		...(base ? Object.keys(base.entries) : []),
 	]);
 	for (const p of candidate) {
+		if (cleanupSet.has(p)) {
+			// 库外伪路径清理：只提交远端 delete / 目标 tombstone，不生成 write/trash/mkdir/rmdir。
+			// 必须排在 excluded 之前：excluded 分支只是 continue，远端 active 条目会原样留在
+			// targetEntries（初值是 remote.entries）里，垃圾永远删不掉。
+			const r = remote.entries[p];
+			if (r?.state === "active") {
+				deletes.push(p);
+				targetEntries[p] = { state: "deleted", kind: r.kind };
+			} else if (r) {
+				targetEntries[p] = { state: "deleted", kind: r.kind }; // 已是 tombstone，不重复 delete
+			} else {
+				delete targetEntries[p]; // 防御 Base/Local 幽灵
+			}
+			continue;
+		}
 		if (excluded(p)) {
 			// 被排除路径本轮完全无操作：目标树沿用 R 的状态（targetEntries 初值即 R 的拷贝），
 			// 既不提交 put/delete，也不下载，且不计入 blocked（用户主动排除，不是异常）
