@@ -8,7 +8,8 @@ export type BlockedReason =
 	| "path_unencodable" // 路径加密仓库：NFC/长度/目录层数超出 token 编码能力
 	| "path_invalid_on_platform" // 远端路径在当前系统不合法（Windows 非法字符/保留名等），本机永远无法落地
 	| "remote_oversized" // 云端已有内容超过当前套餐的单文件上限（升级套餐后自动恢复）
-	| "local_changing"; // 同步期间本地文件持续变化，暂缓该文件并稍后自动重试
+	| "local_changing" // 同步期间本地文件持续变化，暂缓该文件并稍后自动重试
+	| "write_failed"; // 本地文件被系统拒绝写入（只读/ACL/占用），已隔离并稍后重试
 
 export interface BlockedPathInfo {
 	path: string;

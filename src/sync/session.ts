@@ -23,9 +23,10 @@ import {
 	readInterrupted,
 	type TransferMark,
 } from "./transfer-journal";
-import { Applier } from "./applier";
+import { Applier, ApplyBlockedError } from "./applier";
 import { BaseStore } from "./base-store";
 import { mergeBlockedDetails, type BlockedPathInfo } from "./blocked";
+import { isMissingPathError, LocalWriteBlockedError, withPathContext } from "./fs-errors";
 import { sha256Hex } from "./content-hash";
 import { LocalSnapshotBuilder } from "./local-snapshot";
 import { resolveConflictsByMerge, type MergePassResult } from "./merge-pass";
@@ -42,25 +43,8 @@ import { backoffMs, createYieldControl, newUUID } from "./utils";
 /** 12023 连续次数达此值 → 抑制 rename hint 继承（强制新身份，切断复发） */
 const FILE_ID_MOVED_SUPPRESS_AFTER = 2;
 
-/** 读盘失败是否只是「文件不存在」：只有这种情况才能按「本地已删/消失」处理；
- *  超时、权限等 I/O 错误必须原样上抛，不能误判成本地改动。 */
-function isMissingPathError(err: unknown): boolean {
-	const e = err as { name?: unknown; message?: unknown; code?: unknown };
-	if (e?.name === "NotFoundError") return true;
-	// Capacitor（Obsidian 移动端）的文件系统错误用字符串码区分，宿主透传时应优先认码
-	if (typeof e?.code === "string" && /not[_ ]?found/i.test(e.code)) return true;
-	const message = typeof e?.message === "string" ? e.message : "";
-	// 桌面端是 ENOENT / No such file；移动端 Capacitor 的文案是 File does not exist
-	return /not found|enoent|no such file|does not exist/i.test(message);
-}
-
-/** 给读盘异常补上相对路径，便于上报归因（消息会经上报模块脱敏）。 */
-function withPathContext(err: unknown, path: string): Error {
-	const original = err instanceof Error ? err : new Error(String(err));
-	const wrapped = new Error(`读取 ${path} 失败：${original.message || original.name}`);
-	wrapped.name = original.name || "Error";
-	return wrapped;
-}
+/** 本地写入被系统拒绝后的自动重试间隔；手动同步不受此限制 */
+const APPLY_RETRY_BACKOFF_MS = 60_000;
 
 /** 同一路径在同步期间被改动连续达此值 → 暂缓该文件（其他文件照常同步） */
 const UPLOAD_RACE_SUPPRESS_AFTER = 3;
@@ -217,6 +201,14 @@ export class ReconcileSession {
 	private platformBlockedPaths: string[] = [];
 	/** 其中 active 且未被选择性同步排除的路径：仅用于状态展示（tombstone 不展示） */
 	private platformBlockedDetails: BlockedPathInfo[] = [];
+	/** apply 阶段被系统拒绝写入的路径：UI 展示为未同步，planner 本轮不再为它生成动作 */
+	private readonly applyBlockedPaths = new Map<string, BlockedPathInfo>();
+	/** 同一会话同一 errno 只上报一次，避免 recover/sync 双报与每轮重复 */
+	private readonly reportedApplyErrnos = new Set<string>();
+	/** 退避到该时间前不再自动重试；手动同步（interactive）仍会立即重试 */
+	private applyRetryNotBefore = 0;
+	/** apply 阻塞后的自动重试唤醒（单 Session 串行，定时器只负责 requestRun） */
+	private applyRetryTimer: number | null = null;
 	/** 本轮由真实删除事件标记的路径（允许传播超限远端文件的删除） */
 	private confirmedDeletePaths = new Set<string>();
 	/** 本轮开始时快照的删除意图；成功收尾后只清掉这些，保留轮次期间新到的事件 */
@@ -259,6 +251,7 @@ export class ReconcileSession {
 	dispose(): void {
 		this.disposed = true;
 		this.clearDeferralTimer();
+		this.clearApplyRetryTimer();
 		this.deferredRacePaths.clear();
 		this.raceAttempts.clear();
 	}
@@ -330,12 +323,13 @@ export class ReconcileSession {
 	}
 
 	getBlockedPaths(): string[] {
-		// 暂缓路径、平台不可落地路径与本地阻塞合并展示：本轮都不参与对账，其他路径照常同步
+		// 暂缓路径、平台不可落地路径、apply 被拒路径与本地阻塞合并展示：本轮都不参与对账，其他路径照常同步
 		return [
 			...new Set([
 				...this.blockedPaths,
 				...this.deferredRacePaths.keys(),
 				...this.platformBlockedPaths,
+				...this.applyBlockedPaths.keys(),
 			]),
 		];
 	}
@@ -349,6 +343,7 @@ export class ReconcileSession {
 		this.pendingLocalPaths.clear();
 		this.blockedPaths = [];
 		this.localBlockedDetails = [];
+		this.clearApplyBlocked();
 		this.oversizedRemotePaths = [];
 		this.platformBlockedPaths = [];
 		this.platformBlockedDetails = [];
@@ -479,7 +474,7 @@ export class ReconcileSession {
 		// 展示用的合并（本地原因优先）：只影响状态文案，planner 仍分开消费各自的原始集合。
 		// 平台不可落地路径没有「本地」来源，与本地阻塞一起作为最高优先级的已知原因参与合并
 		const blockedDetails = mergeBlockedDetails(
-			[...this.localBlockedDetails, ...this.platformBlockedDetails],
+			[...this.localBlockedDetails, ...this.applyBlockedPaths.values(), ...this.platformBlockedDetails],
 			this.oversizedRemotePaths,
 			[...this.deferredRacePaths.keys()],
 		).filter((detail) => !isExternalPath(detail.path));
@@ -526,6 +521,52 @@ export class ReconcileSession {
 		this.lastSyncAt = Date.now();
 		// 成功跑完一轮即不再是「中断现场」的提示语境
 		this.interruptedTransfer = null;
+	}
+
+	/** apply 阶段被系统拒绝写入：记录 blocked 路径、设置退避、按 errno 每会话只上报一次。 */
+	private handleApplyBlocked(phase: "sync" | "recover", err: ApplyBlockedError): void {
+		for (const path of err.paths) {
+			this.applyBlockedPaths.set(path, { path, reason: "write_failed" });
+		}
+		this.applyRetryNotBefore = Date.now() + APPLY_RETRY_BACKOFF_MS;
+		for (const errno of err.errnos) {
+			if (this.reportedApplyErrnos.has(errno)) continue;
+			this.reportedApplyErrnos.add(errno);
+			reportError(phase, new LocalWriteBlockedError(errno), {
+				fsErrno: errno,
+				applyFailedCount: err.paths.length,
+			});
+		}
+		debugLog.warn(
+			`[pickpen] ${err.paths.length} 个文件被系统拒绝写入（${err.errnos.join("/")}），已隔离并保留 pending`,
+		);
+		this.scheduleApplyRetry();
+		this.report();
+	}
+
+	/** 恢复成功 / pending 失效：解除 apply 阻塞、退避与自动重试。 */
+	private clearApplyBlocked(): void {
+		this.applyBlockedPaths.clear();
+		this.applyRetryNotBefore = 0;
+		this.reportedApplyErrnos.clear();
+		this.clearApplyRetryTimer();
+	}
+
+	/** 退避到期后唤醒一轮；运行中由 requestRun 合并为 rerun */
+	private scheduleApplyRetry(): void {
+		this.clearApplyRetryTimer();
+		if (this.disposed || this.applyRetryNotBefore <= 0) return;
+		const delay = Math.max(50, this.applyRetryNotBefore - Date.now());
+		this.applyRetryTimer = window.setTimeout(() => {
+			this.applyRetryTimer = null;
+			if (!this.disposed) this.requestRun();
+		}, delay);
+	}
+
+	private clearApplyRetryTimer(): void {
+		if (this.applyRetryTimer === null) return;
+		window.clearTimeout(this.applyRetryTimer);
+		this.applyRetryTimer = null;
 	}
 
 	/**
@@ -616,6 +657,11 @@ export class ReconcileSession {
 						this.storageLimitExceeded = true;
 						this.storageLimitConfirmed = true;
 						this.lastError = "云端存储已满，新改动暂时无法上传";
+					} else if (err instanceof ApplyBlockedError) {
+						// 本轮其他文件已落地；失败文件保留在 pending 中，退避后重试。
+						// 不在这里 reportError：handleApplyBlocked 按 errno 每会话只报一次
+						this.lastError = "部分文件暂时无法写入，已保留待重试";
+						this.handleApplyBlocked("sync", err);
 					} else {
 						this.lastError = `同步失败：${(err as Error).message ?? String(err)}`;
 						debugLog.error("[pickpen] Session 失败", err);
@@ -786,7 +832,13 @@ export class ReconcileSession {
 
 		// 1. pending 恢复（§9.1 步骤 1 / §9.4）
 		if (pendingStore.getPending()) {
-			await this.recoverPending();
+			const recovered = await this.recoverPending(interactive);
+			// 恢复失败时保留 pending 并结束本轮：继续同步会写新 pending 覆盖失败动作，
+			// 同一故障也会被 recover/sync 双报
+			if (!recovered) {
+				this.requeueDirty(); // 本轮尚未扫描：dirty 放回，避免本地改动被漏掉
+				return;
+			}
 		}
 
 		// 2. 保存打开视图中的未落盘编辑（§9.1 步骤 2，view-sync 复用）
@@ -957,6 +1009,7 @@ export class ReconcileSession {
 				...this.blockedPaths,
 				...this.deferredRacePaths.keys(),
 				...this.platformBlockedPaths,
+				...this.applyBlockedPaths.keys(),
 			]),
 		].filter((p) => !isExternalPath(p));
 		const planResult = plan({
@@ -1014,6 +1067,22 @@ export class ReconcileSession {
 
 		// 记录 Session 快照时的目标路径 hash（覆盖前用户改动检测）
 		const expectedHashes = this.captureExpectedHashes(planResult, local);
+		// pending 重放保护：把「计划时目标存在且 hash」或「确认不存在」写进动作。
+		// 失败重放可能间隔数轮/重启，期间用户改过、删过或新建过该文件时不能覆盖
+		const planBlockedSet = new Set(planBlockedPaths);
+		const expectedAbsentPaths = new Set<string>();
+		for (const a of planResult.apply_actions) {
+			if (a.kind !== "write" && a.kind !== "trash") continue;
+			const expected = expectedHashes.get(a.path);
+			if (expected !== undefined) a.expected_hash = expected;
+			else if (a.kind === "write") {
+				const le = local.entries[a.path];
+				if ((!le || le.state !== "active") && !planBlockedSet.has(a.path)) {
+					a.expected_absent = true;
+					expectedAbsentPaths.add(a.path);
+				}
+			}
+		}
 
 		// 本轮不在同步范围内的路径：Base 条目只是远端回声（planner 按 Bootstrap 裁决），
 		// 标记 out_of_scope 交给下一轮，避免开关打开时把本地旧内容当成「仅本地修改」传上去
@@ -1128,7 +1197,16 @@ export class ReconcileSession {
 						await remote.putBlob(hash, sealedBytes);
 						return;
 					}
-					const content = new Uint8Array(await app.vault.adapter.readBinary(srcPath));
+					let raw: ArrayBuffer;
+					try {
+						raw = await app.vault.adapter.readBinary(srcPath);
+					} catch (err) {
+						// 扫描/复验后用户改名或删除（Untitled.md 是典型中间名）：按计划过期处理，
+						// 标脏重排，不中止整轮、不上报
+						if (isMissingPathError(err)) throw new LocalChangedDuringUploadError(srcPath);
+						throw withPathContext(err, srcPath);
+					}
+					const content = new Uint8Array(raw);
 					// 上传统一出口：加密仓库在这里转成密文。
 					// 声明哈希用计划里的 hash：sealed.hash 就是这批字节（加密仓库下是密文）的 SHA-256，
 					// 与计划不一致 = 文件在上传期间被改动。此时不发请求——上传会把错误内容写到该地址下，
@@ -1221,6 +1299,7 @@ export class ReconcileSession {
 			actions: planResult.apply_actions,
 			conflicts: planResult.conflict_copies,
 			expectedHashes,
+			expectedAbsent: expectedAbsentPaths,
 			expectedRevision: commit.revision,
 			expectedRootHash: commit.rootHash,
 			tmpDir: this.tmpDir,
@@ -1263,12 +1342,16 @@ export class ReconcileSession {
 	}
 
 	/** pending 恢复（§9.4）：Remote 与 pending target 一致 → 完成本地落地并更新 Base；
-	 * 不一致 → 不盲目重放，清 pending 重新三方对账 */
-	private async recoverPending(): Promise<void> {
+	 * 不一致 → 不盲目重放，清 pending 重新三方对账。
+	 * 返回 false 表示本轮不能继续（pending 保留）：避免同一轮继续同步时覆写 pending，
+	 * 也避免 recover 与 sync 对同一故障双报。 */
+	private async recoverPending(interactive: boolean): Promise<boolean> {
 		const { remote, pendingStore, baseStore } = this.deps;
 		const settings = this.deps.getSettings();
 		const pending = pendingStore.getPending();
-		if (!pending || !settings.accessToken || !settings.vaultId) return;
+		if (!pending || !settings.accessToken || !settings.vaultId) return true;
+		// 本地写入被系统拒绝后的退避窗口：后台轮次不再紧密重试；手动同步仍立即尝试
+		if (!interactive && Date.now() < this.applyRetryNotBefore) return false;
 
 		this.beginPhase("recovering");
 		let head;
@@ -1279,19 +1362,20 @@ export class ReconcileSession {
 				// pending 保留在磁盘上（不销毁用户数据）；等重新绑定到有效仓库后再处理
 				this.lastError = "仓库不存在，请重新选择要绑定的仓库";
 				this.deps.pauseSync?.(PAUSED_VAULT_NOT_FOUND);
-				return;
+				return false;
 			}
 			reportError("recover", err);
-			return; // 网络失败：保留 pending，下次 Session 再试
+			return false; // 网络失败：保留 pending，下次 Session 再试
 		}
-		if (!head) return;
+		if (!head) return false;
 		const pathMode = head.pathEncryptionVersion === 1 ? PATH_MODE_ENCRYPTED : PATH_MODE_PLAIN;
 		// pending 是上一轮路径口径下的目标；仓库在期间完成/回退了路径加密时，
 		// apply_actions 本身仍是明文路径，但 target_root_hash 已不可比，重新对账更安全。
 		if ((pending.path_mode ?? PATH_MODE_PLAIN) !== pathMode) {
 			await pendingStore.clear();
 			this.forceAudit = true;
-			return;
+			this.clearApplyBlocked();
+			return true;
 		}
 
 		if (head.rootHash === pending.target_root_hash) {
@@ -1346,11 +1430,19 @@ export class ReconcileSession {
 				const actions = pending.apply_actions.filter(
 					(a) => !unlandablePaths.has(a.path) && !externalActionPaths.has(a.path),
 				);
+				// 记录计划时目标的本地状态：重放间隔可能跨轮/重启，用户改过、删过或新建过时不能覆盖
+				const retryExpectedHashes = new Map<string, string>();
+				const retryExpectedAbsent = new Set<string>();
+				for (const a of pending.apply_actions) {
+					if (a.expected_hash !== undefined) retryExpectedHashes.set(a.path, a.expected_hash);
+					else if (a.expected_absent) retryExpectedAbsent.add(a.path);
+				}
 				await this.applier.applyPlan({
 					onProgress: this.beginPhase("applying"),
 					actions,
 					conflicts: [],
-					expectedHashes: new Map(),
+					expectedHashes: retryExpectedHashes,
+					expectedAbsent: retryExpectedAbsent,
 					expectedRevision: head.revision,
 					expectedRootHash: head.rootHash,
 					tmpDir: this.tmpDir,
@@ -1386,15 +1478,25 @@ export class ReconcileSession {
 				await pendingStore.clear();
 				this.forceAudit = true; // 落地后完整审计校正本地状态
 				this.lastError = "";
+				this.clearApplyBlocked();
+				await this.applier.cleanupTemp(this.tmpDir);
 			} catch (err) {
 				debugLog.error("[pickpen] pending 恢复失败（保留 pending 重试）", err);
-				reportError("recover", err);
+				if (err instanceof ApplyBlockedError) {
+					this.lastError = "部分文件暂时无法写入，已保留待重试";
+					this.handleApplyBlocked("recover", err);
+				} else {
+					reportError("recover", err);
+				}
+				return false;
 			}
-			return;
+			return true;
 		}
 		// Remote 不一致：旧 apply_actions 作废，重新三方对账（本地内容不确定时由 planner 进冲突副本）
 		await pendingStore.clear();
 		this.forceAudit = true;
+		this.clearApplyBlocked();
+		return true;
 	}
 
 	/** 记录 apply 目标路径在 Session 快照时的 hash（用户改动检测基线）。

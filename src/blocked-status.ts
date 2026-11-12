@@ -16,6 +16,7 @@ const REASON_ORDER: readonly BlockedReason[] = [
 	"path_invalid_on_platform",
 	"remote_oversized",
 	"local_changing",
+	"write_failed",
 ];
 
 /** 折叠时的归类短语（比单文件短语短，便于一行放下） */
@@ -27,6 +28,7 @@ const GROUP_LABELS: Record<BlockedReason, string> = {
 	path_invalid_on_platform: "名称在当前系统不可用",
 	remote_oversized: "云端存量文件超限",
 	local_changing: "本地文件仍在修改",
+	write_failed: "本地文件被占用或只读",
 };
 
 export interface BlockedFile {
@@ -71,6 +73,8 @@ export function blockedReasonLabel(reason: BlockedReason, maxFileSizeBytes: numb
 			return `云端已有内容超过单文件上限${limit}，升级套餐后自动恢复`;
 		case "local_changing":
 			return "同步期间本地文件持续变化，稍后自动重试";
+		case "write_failed":
+			return "本地文件被占用或只读，稍后自动重试";
 	}
 }
 

@@ -3,6 +3,8 @@
 
 import { App } from "obsidian";
 
+import { isBusyPathError } from "./fs-errors";
+
 /** Uint8Array → ArrayBuffer（adapter.writeBinary 入参；复制一份避免视图偏移） */
 export function toArrayBuffer(data: Uint8Array): ArrayBuffer {
 	const copy = new Uint8Array(data.byteLength);
@@ -28,6 +30,22 @@ export async function ensureParentDirs(app: App, path: string): Promise<void> {
 export async function writeLocalFile(app: App, path: string, content: Uint8Array): Promise<void> {
 	await ensureParentDirs(app, path);
 	await app.vault.adapter.writeBinary(path, toArrayBuffer(content));
+}
+
+/** 目标文件被占用/只读时的短重试间隔：瞬时锁（杀软、云同步、宿主写入）大多能在 1 秒内自愈 */
+const BUSY_WRITE_RETRY_DELAYS_MS = [100, 300] as const;
+
+/** 写盘并对 EPERM/EACCES/EBUSY 做有界重试；其他错误立即上抛。 */
+export async function writeLocalFileWithRetry(app: App, path: string, content: Uint8Array): Promise<void> {
+	for (let attempt = 0; ; attempt++) {
+		try {
+			await writeLocalFile(app, path, content);
+			return;
+		} catch (err) {
+			if (attempt >= BUSY_WRITE_RETRY_DELAYS_MS.length || !isBusyPathError(err)) throw err;
+			await new Promise<void>((resolve) => window.setTimeout(resolve, BUSY_WRITE_RETRY_DELAYS_MS[attempt]));
+		}
+	}
 }
 
 /** 本地文件复制（冲突副本用；读二进制再写，避免依赖 rename 语义） */

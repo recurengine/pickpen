@@ -28,7 +28,7 @@ describe("未同步文件文案", () => {
 		expect(s.detail).toBe("未同步文件：附件/大图.png（超过单文件上限 5 MB）\n其他文件不受影响");
 	});
 
-	it("六种原因各有自己的说明", () => {
+	it("七种原因各有自己的说明", () => {
 		expect(blockedReasonLabel("oversized", 30 * MB)).toBe("超过单文件上限 30 MB");
 		expect(blockedReasonLabel("read_failed", 30 * MB)).toBe("无法读取本地内容，下次同步会重试");
 		expect(blockedReasonLabel("case_conflict", 30 * MB)).toBe("与另一项名称仅大小写不同");
@@ -39,6 +39,7 @@ describe("未同步文件文案", () => {
 			"云端已有内容超过单文件上限 30 MB，升级套餐后自动恢复",
 		);
 		expect(blockedReasonLabel("local_changing", 30 * MB)).toBe("同步期间本地文件持续变化，稍后自动重试");
+		expect(blockedReasonLabel("write_failed", 30 * MB)).toBe("本地文件被占用或只读，稍后自动重试");
 	});
 
 	it("上限未知时不编造数值", () => {

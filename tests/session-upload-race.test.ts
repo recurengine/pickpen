@@ -35,6 +35,8 @@ function fakeDeps(
 		contents?: Record<string, string>;
 		/** 暂缓后的自动重试延迟（毫秒）；默认 60s，测试调小 */
 		uploadRaceDeferMs?: number;
+		/** 这些路径在 hasBlobs 之后首次读取时抛 ENOENT（模拟上传窗口内被改名/删除） */
+		missingAfterHasBlobs?: string[];
 	} = {},
 ) {
 	const base: Snapshot = {
@@ -55,6 +57,8 @@ function fakeDeps(
 	// 写盘产物（临时区/落盘）按路径回读：合并产物走的就是这条路
 	const written = new Map<string, Uint8Array>();
 	let round = 0;
+	const missingAfterHasBlobs = new Set(overrides.missingAfterHasBlobs ?? []);
+	let hasBlobsCalled = false;
 	const files = (overrides.files ?? ["a.md"]).map((path) => ({ path, stat: { mtime: 1, size: 2 } }));
 	return {
 		setContent: (s: string) => {
@@ -70,6 +74,12 @@ function fakeDeps(
 					configDir: ".obsidian",
 					adapter: {
 						readBinary: vi.fn(async (path: string) => {
+							if (hasBlobsCalled && missingAfterHasBlobs.delete(path)) {
+								throw Object.assign(
+									new Error(`ENOENT: no such file or directory, open '${path}'`),
+									{ code: "ENOENT" },
+								);
+							}
 							const w = written.get(path);
 							if (w) return w;
 							const c = contents.get(path);
@@ -122,6 +132,7 @@ function fakeDeps(
 				getManifest: vi.fn(async () => ({ entries: overrides.manifestEntries ?? {} })),
 				getHead: vi.fn(),
 				hasBlobs: vi.fn(async () => {
+					hasBlobsCalled = true;
 					overrides.onHasBlobs?.(++round);
 					return new Set<string>();
 				}),
@@ -180,6 +191,23 @@ describe("ReconcileSession 上传期间本地变动", () => {
 		expect(new TextDecoder().decode(bytes)).toBe("v2-changed");
 		const last = lastStatus(deps);
 		expect(last.lastError).toBe(""); // 静默收敛：不出现「文件哈希非法」红字
+		expect(last.allSynced).toBe(true);
+	});
+
+	it("上传读取时源文件已消失 → 按本地竞态静默重排，不报 sync 失败", async () => {
+		const putBlob = vi.fn<SnapshotRemote["putBlob"]>(async () => {});
+		const { deps } = fakeDeps({ missingAfterHasBlobs: ["a.md"], putBlob });
+		const session = new ReconcileSession(deps as never);
+
+		session.requestRun({ forceAudit: true });
+		await waitForIdle(session);
+
+		// 第一轮上传读取 ENOENT → LocalChangedDuringUploadError 静默重排；
+		// 第二轮源文件恢复可读，正常上传
+		expect(deps.remote.hasBlobs).toHaveBeenCalledTimes(2);
+		expect(putBlob).toHaveBeenCalledTimes(1);
+		const last = lastStatus(deps);
+		expect(last.lastError).toBe("");
 		expect(last.allSynced).toBe(true);
 	});
 

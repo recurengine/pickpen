@@ -64,6 +64,10 @@ export interface ApplyAction {
 	temp_path?: string; // write：插件私有临时区文件
 	content_hash: string; // write：目标内容 hash（幂等判定）；mkdir/rmdir：空
 	size: string; // write：目标内容字节数；mkdir/rmdir："0"
+	/** write：计划时目标路径在本地快照中的 hash；pending 重放时用于识别用户后续改动 */
+	expected_hash?: string;
+	/** write：计划时目标路径确认不存在；重放时若已出现，说明用户新建，不能覆盖 */
+	expected_absent?: boolean;
 }
 
 /** 冲突副本（planner 输出）：Local 内容保存到新路径，Remote 保持原路径 */

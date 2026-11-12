@@ -46,6 +46,10 @@ export interface ErrorExtra {
 	durationMs?: number;
 	baseLoadResult?: string;
 	vaultIdOverride?: string;
+	/** 文件系统字符串 errno（EPERM/EACCES/EBUSY/ENOENT），与数字业务码分家 */
+	fsErrno?: string;
+	/** 本轮被系统拒绝写入的文件数（只记数量，不记路径） */
+	applyFailedCount?: number;
 }
 
 export interface QueuedReport {

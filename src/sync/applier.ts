@@ -10,6 +10,7 @@ import { App, normalizePath } from "obsidian";
 
 import { isTooBig } from "../excludes";
 import { openForLocal, remoteHash } from "../crypto/vault-key-store";
+import { fsErrnoOf, isBusyPathError, isMissingPathError, withPathContext } from "./fs-errors";
 import { ProgressTracker, type ProgressCallback } from "./progress";
 import { beginTransfer, endTransfer } from "./transfer-journal";
 import { sha256Hex } from "./content-hash";
@@ -22,7 +23,30 @@ import {
 	UNKNOWN_SIZE_BYTES,
 	type YieldControl,
 } from "./utils";
-import { ensureParentDirs, writeLocalFile } from "./vault-io";
+import { ensureParentDirs, writeLocalFile, writeLocalFileWithRetry } from "./vault-io";
+
+/** 单个文件被系统拒绝写入（权限/只读/占用），已隔离但本轮无法落地。 */
+export interface ApplyBusyFailure {
+	path: string;
+	errno: string;
+}
+
+/**
+ * 本轮有文件因系统拒绝写入而未能落地：其他动作已经执行完，失败动作保留在 pending 中。
+ * message 只含 errno，不采集用户路径。
+ */
+export class ApplyBlockedError extends Error {
+	readonly errnos: string[];
+	readonly paths: string[];
+
+	constructor(failures: ApplyBusyFailure[]) {
+		const errnos = [...new Set(failures.map((f) => f.errno || "UNKNOWN"))];
+		super(`本地文件暂时无法写入（${errnos.join("/")}）`);
+		this.name = "ApplyBlockedError";
+		this.errnos = errnos;
+		this.paths = [...new Set(failures.map((f) => f.path))];
+	}
+}
 
 export interface ApplyContext {
 	/** Session 开始时记录的目标路径 hash（write 目标内容 / trash 时当前文件 hash） */
@@ -66,11 +90,18 @@ export class Applier {
 		if (typeof adapter.trashSystem === "function") {
 			try {
 				if (await adapter.trashSystem(path)) return;
-			} catch {
-				// 落到 remove
+			} catch (err) {
+				// 源文件已不存在：删除意图已达成
+				if (isMissingPathError(err)) return;
+				// 系统回收站不可用/被占用：落到 remove 再试
 			}
 		}
-		await adapter.remove(path);
+		try {
+			await adapter.remove(path);
+		} catch (err) {
+			// remove 才发现不存在，同样是幂等成功
+			if (!isMissingPathError(err)) throw err;
+		}
 	}
 
 	/**
@@ -155,6 +186,8 @@ export class Applier {
 		actions: ApplyAction[];
 		conflicts: ConflictCopy[];
 		expectedHashes: Map<string, string>;
+		/** 计划时确认目标不存在的 write 路径：重放时若已出现，说明用户新建，不能覆盖 */
+		expectedAbsent?: ReadonlySet<string>;
 		expectedRevision: bigint;
 		expectedRootHash: string;
 		tmpDir: string;
@@ -168,6 +201,8 @@ export class Applier {
 		const { actions, conflicts, expectedHashes, expectedRevision, expectedRootHash, tmpDir } = args;
 		const yc = args.yieldControl ?? createYieldControl();
 		const skipped = new Set<string>();
+		/** 系统拒绝写入的 write/mkdir：其他动作照常执行，最后统一抛 ApplyBlockedError */
+		const busyFailures: ApplyBusyFailure[] = [];
 		// 冲突副本取材失败（配置路径）时不得覆盖的原路径：见下方 conflicts 循环
 		const protectedPaths = new Set<string>();
 		let batchCount = 0;
@@ -238,10 +273,19 @@ export class Applier {
 			try {
 				await maybeYield();
 				if (action.kind === "mkdir") {
-					// 幂等创建目录（先逐级建父目录）
-					await ensureParentDirs(this.app, action.path);
-					if (!(await this.app.vault.adapter.exists(action.path))) {
-						await this.app.vault.adapter.mkdir(action.path);
+					// 幂等创建目录（先逐级建父目录）；权限/占用错误隔离，不拖垮同轮其他文件
+					try {
+						await ensureParentDirs(this.app, action.path);
+						if (!(await this.app.vault.adapter.exists(action.path))) {
+							await this.app.vault.adapter.mkdir(action.path);
+						}
+					} catch (err) {
+						if (isBusyPathError(err)) {
+							busyFailures.push({ path: action.path, errno: fsErrnoOf(err) || "UNKNOWN" });
+							processed = false;
+							continue;
+						}
+						throw err;
 					}
 					continue;
 				}
@@ -277,15 +321,25 @@ export class Applier {
 								skipped.add(action.path);
 								continue;
 							}
-						} catch {
-							continue; // 读失败视为不存在，幂等跳过
+						} catch (err) {
+							if (isMissingPathError(err)) continue; // 真不存在：幂等成功
+							// 权限/占用不是「已删除」：本轮失败并保留 pending，避免误落 tombstone 后
+							// 下一轮把远端删除复活
+							throw withPathContext(err, action.path);
 						}
 					}
-					if (file) {
-						// 走宿主的删除流程（尊重用户的「系统回收站 / 本地 .trash」偏好）
-						await this.app.fileManager.trashFile(file);
-					} else {
-						await this.trashUnindexed(action.path);
+					try {
+						if (file) {
+							// 走宿主的删除流程（尊重用户的「系统回收站 / 本地 .trash」偏好）
+							await this.app.fileManager.trashFile(file);
+						} else {
+							await this.trashUnindexed(action.path);
+						}
+					} catch (err) {
+						// 源文件已被用户/其他设备删除（Obsidian trashLocal 内部 rename 才会发现）：
+						// 删除意图已达成，幂等成功；其他错误照常上抛
+						if (isMissingPathError(err)) continue;
+						throw err;
 					}
 					continue;
 				}
@@ -321,8 +375,28 @@ export class Applier {
 						skipped.add(action.path);
 						continue;
 					}
+					// 计划时目标不存在、现在出现：用户在重放窗口内新建，不能覆盖
+					if (args.expectedAbsent?.has(action.path)) {
+						skipped.add(action.path);
+						continue;
+					}
+				} else if (expectedHashes.has(action.path)) {
+					// 计划时目标存在、现在消失：用户在重放窗口内删除，不能重建
+					skipped.add(action.path);
+					continue;
 				}
-				await writeLocalFile(this.app, action.path, content);
+				try {
+					await writeLocalFileWithRetry(this.app, action.path, content);
+				} catch (err) {
+					if (isBusyPathError(err)) {
+						// 该文件被系统拒绝写入：记下来继续后面的动作，本轮结束时统一抛出；
+						// pending 保留，下一轮重放该文件
+						busyFailures.push({ path: action.path, errno: fsErrnoOf(err) || "UNKNOWN" });
+						processed = false;
+						continue;
+					}
+					throw err;
+				}
 
 			} catch (err) {
 				processed = false;
@@ -335,6 +409,7 @@ export class Applier {
 		if (args.onSkipped) {
 			for (const p of skipped) args.onSkipped(p);
 		}
+		if (busyFailures.length > 0) throw new ApplyBlockedError(busyFailures);
 		return [...skipped];
 	}
 

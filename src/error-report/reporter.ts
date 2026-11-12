@@ -203,6 +203,8 @@ export class ErrorReporter {
 			rpc_method: extra.rpcMethod,
 			duration_ms: extra.durationMs,
 			base_load_result: extra.baseLoadResult,
+			fs_errno: extra.fsErrno,
+			apply_failed_count: extra.applyFailedCount,
 		};
 		return Object.fromEntries(Object.entries(context).filter(([, value]) => value !== undefined && value !== ""));
 	}
